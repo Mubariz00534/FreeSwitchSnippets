@@ -1,0 +1,296 @@
+add to lang/en/ivr/sounds.xml    after give reloadxml
+
+<macro name="play_2_files">
+    <input pattern="^(.*?):(.*)$">
+        <match>
+           <action function="play-file" data="$1"/>
+           <action function="execute" data="sleep(500)"/>
+           <action function="play-file" data="$2"/>
+        </match>
+    </input>
+  </macro>
+---------------------------------------------------------------------------------
+
+extension in ivr .lua
+
+domain = argv[1];
+sound_path = argv[2];
+
+local function isempty(s)
+    return s == nil or s == ''
+end
+
+session:answer()
+digits = session:playAndGetDigits(1, 4, 1, 3000, '#', sound_path, "", '(\\d+|\\*)', 'digits')
+
+
+
+session:setVariable("recording_follow_transfer", "true")
+session:transfer(digits, "XML", domain);
+
+
+----------------------------------------------------------------------------------
+
+ask_internal_externsion.lua
+
+intro_sound_path = argv[1];
+domain = argv[2];
+queue = argv[3];
+
+local function isempty(s)
+    return s == nil or s == ''
+end
+
+session:answer()
+digits = session:playAndGetDigits(1, 4, 1, 3000, '#', intro_sound_path, "", '(\\d+|\\*)', 'digits                    ')
+
+
+if isempty(digits) then
+    session:execute("callcenter", queue)
+else
+    session:setVariable("recording_follow_transfer", "true")
+    session:transfer(digits, "XML", domain);
+end
+
+------------------------------------------------------------------------
+
+event hook to send current caller id. put cc-event.lua into $${scripts_dir}/hooks directory with this content:
+
+local action = event:getHeader("CC-Action")
+local caller_id_number = event:getHeader("CC-Member-CID-Number")
+local uuid = event:getHeader("CC-Member-Session-UUID")
+local agentUuid = event:getHeader("CC-Agent-UUID")
+
+if action == "bridge-agent-start" then
+   local agent = event:getHeader("CC-Agent")
+   local api = freeswitch.API()
+   local targetNumber = api:executeString("uuid_getvar " .. uuid .. " " .. "sip_h_X-Target-Number")
+   local targetNumberName = api:executeString("uuid_getvar " .. uuid .. " " .. "sip_h_X-Target-Number-Name")
+   local targetQueueName = api:executeString("uuid_getvar " .. uuid .. " " .. "sip_h_X-Target-Queue-Name")
+   local sipCallId = api:executeString("uuid_getvar " .. agentUuid .. " " .. "sip_call_id")
+   local msg = "system:event:" .. action .. ":uuid=" .. uuid .. ";call_id=".. sipCallId .. ";caller_id_number=" .. caller_id_number .. ";target_number=" .. targetNumber .. ";target_number_name=" .. targetNumberName .. ";target_queue_name=" .. targetQueueName
+   api:executeString("chat sip|server|internal/" .. agent .."|" .. msg)
+end
+
+in autoload_configs/lua.conf.xml put:
+
+<hook event="CUSTOM" subclass="callcenter::info" script="$${script_dir}/hooks/cc-event.lua"/>
+<hook event="CUSTOM" subclass="callcenter::info" script="$${script_dir}/hooks/event-poster.lua"/>
+<hook event="CUSTOM" subclass="sofia::register" script="$${script_dir}/hooks/event-poster.lua"/>
+<hook event="CUSTOM" subclass="sofia::unregister" script="$${script_dir}/hooks/event-poster.lua"/>
+
+
+
+event hook to post freeswitch events to our application. put event-poster.lua into $${scripts_dir}/hooks directory with this content:
+
+local api = freeswitch.API()
+api:executeString("bgapi curl http://192.168.8.100/xmlcurl/freeswitch-event headers post " .. event:serialize())
+
+in autoload_configs/lua.conf.xml put:
+
+<hook event="CUSTOM" subclass="callcenter::info" script="$${script_dir}/hooks/event-poster.lua"/>
+<hook event="CUSTOM" subclass="sofia::register" script="$${script_dir}/hooks/event-poster.lua"/>
+<hook event="CUSTOM" subclass="sofia::unregister" script="$${script_dir}/hooks/event-poster.lua"/>
+
+in autoload_configs/nibblebill.conf.xml change actions to "no_funds_for_call"
+
+
+
+add this to $${script_dir}/callcenter-announce.lua file
+
+-------------
+-- callcenter-announce.lua
+-- Arguments are, in order: caller uuid, queue_name, announce_interval, announce_message, delay_start_interval, delay_message.
+
+function explode(div,str)
+    if (div=='') then return false end
+    local pos,arr = 0,{}
+    for st,sp in function() return string.find(str,div,pos,true) end do
+        table.insert(arr,string.sub(str,pos,st-1))
+        pos = sp + 1
+    end
+    table.insert(arr,string.sub(str,pos))
+    return arr
+end
+
+function index_of(t,val)
+    for k,v in ipairs(t) do
+        if v == val then return k end
+    end
+end
+
+local function isempty(s)
+  return s == nil or s == ''
+end
+
+api = freeswitch.API()
+caller_uuid = argv[1]
+queue_name = argv[2]
+announce_interval = argv[3]
+announce_message = argv[4]
+delay_start_interval = argv[5]
+delay_message = argv[6]
+
+if caller_uuid == nil or queue_name == nil then
+    return
+end
+while (true) do
+    -- Pause between announcements
+    freeswitch.msleep(tonumber(announce_interval) * 1000)
+    members = api:executeString("callcenter_config queue list members "..queue_name)
+    line_ix = 1
+    column_titles = {}
+    score_index = 0
+
+    exists = false
+
+    for line in members:gmatch("[^\r\n]+") do
+
+        if line_ix == 1 then
+            column_titles = explode("|", line)
+            score_index = index_of(column_titles, 'score')
+        end
+
+        if (string.find(line, "Trying") ~= nil or string.find(line, "Waiting") ~= nil) then
+            -- Members have a position when their state is Waiting or Trying
+
+            entry_fields = explode("|", line)
+            score = entry_fields[score_index]
+
+            message_to_play = ''
+
+            if isempty(announce_message) ~= true then
+                message_to_play = announce_message
+            end
+
+            if isempty(delay_message) ~= true and tonumber(score) >= tonumber(delay_start_interval) then
+                message_to_play = delay_message
+            end
+
+            if isempty(message_to_play) == false then
+                api:executeString("uuid_broadcast "..caller_uuid.." "..message_to_play.." aleg")
+            end
+
+            exists = true
+        end
+
+        line_ix = line_ix + 1
+    end
+    -- If member was not found in queue, or it's status is Aborted - terminate script
+    if exists == false then
+        freeswitch.consoleLog("info", "Exiting\n")
+        return
+    end
+end
+-------------------
+
+============================================================================
+
+-- callcenter-announce.lua
+-- Arguments are, in order: caller uuid, queue_name, announce_interval, announce_message, delay_start_interval, delay_message.
+
+function explode(div,str)
+    if (div=='') then return false end
+    local pos,arr = 0,{}
+    for st,sp in function() return string.find(str,div,pos,true) end do
+        table.insert(arr,string.sub(str,pos,st-1))
+        pos = sp + 1
+    end
+    table.insert(arr,string.sub(str,pos))
+    return arr
+end
+
+function index_of(t,val)
+    for k,v in ipairs(t) do
+        if v == val then return k end
+    end
+end
+
+local function isempty(s)
+  return s == nil or s == ''
+end
+
+api = freeswitch.API()
+caller_uuid = argv[1]
+queue_name = argv[2]
+announce_position_in_queue = argv[3]
+announce_position_interval = argv[4]
+sound_language = argv[5]
+announce_interval = argv[6]
+announce_message = argv[7]
+delay_start_interval = argv[8]
+delay_message = argv[9]
+
+
+if caller_uuid == nil or queue_name == nil then
+    return
+end
+while (true) do
+    -- Pause between announcements
+	if isempty(announce_position_interval) ~= false then
+		announce_position_interval = 2
+	end
+    freeswitch.msleep(tonumber(announce_position_interval) * 1000)
+    members = api:executeString("callcenter_config queue list members "..queue_name)
+    line_ix = 1
+    column_titles = {}
+    score_index = 0
+
+    exists = false
+
+    for line in members:gmatch("[^\r\n]+") do
+
+        if line_ix == 1 then
+            column_titles = explode("|", line)
+            score_index = index_of(column_titles, 'score')
+        end
+
+        if (string.find(line, "Trying") ~= nil or string.find(line, "Waiting") ~= nil) then
+            -- Members have a position when their state is Waiting or Trying
+
+            entry_fields = explode("|", line)
+            score = entry_fields[score_index]
+
+            message_to_play = ''
+			
+			freeswitch.consoleLog("info", "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+			freeswitch.consoleLog("info", line_ix)
+
+            if isempty(announce_message) ~= true then
+                message_to_play = announce_message
+            end
+
+            if isempty(delay_message) ~= true and tonumber(score) >= tonumber(delay_start_interval) then
+                message_to_play = delay_message
+            end
+			
+			if isempty(message_to_play) == false then
+                api:executeString("uuid_broadcast "..caller_uuid.." "..message_to_play.." aleg")
+            end
+			
+			
+			if tonumber(announce_position_in_queue) == 1 then
+				if string.find(line, caller_uuid, 1, true) ~= nil then
+					-- Member still in queue, so script must continue
+					exists = true
+					api:executeString("uuid_broadcast "..caller_uuid.." /usr/share/freeswitch/sounds/queue_sounds/"..sound_language.."/"..sound_language..".wav aleg")
+					api:executeString("uuid_broadcast "..caller_uuid.." /usr/share/freeswitch/sounds/queue_sounds/"..sound_language.."/"..line_ix..".wav aleg")
+				end
+			end
+			
+			exists = true
+			
+			line_ix = line_ix + 1
+        end
+
+        --line_ix = line_ix + 1
+    end
+    -- If member was not found in queue, or it's status is Aborted - terminate script
+    if exists == false then
+        freeswitch.consoleLog("info", "Exiting\n")
+        return
+    end
+end
+
+
+============================================================================
