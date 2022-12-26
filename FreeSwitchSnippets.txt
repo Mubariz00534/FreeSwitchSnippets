@@ -294,3 +294,19 @@ end
 
 
 ============================================================================
+Handling zombie calls in FS | sqlite 
+#!/bin/bash
+t=$(date +%s)
+let "tt=$t-3500"
+
+echo $tt
+
+sql_channels="DELETE FROM channels WHERE created_epoch < $tt"
+sql_calls="DELETE FROM calls WHERE call_created_epoch < $tt"
+#s="SELECT * FROM nat"
+#ss=".tables"
+
+
+/usr/bin/sqlite3 /usr/local/freeswitch/db/core.db "$sql_channels"
+/usr/bin/sqlite3 /usr/local/freeswitch/db/core.db "$sql_calls"
+
